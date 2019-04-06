@@ -115,7 +115,6 @@ public:
     std::uint32_t timeouts;
     std::uint32_t package_size;
     std::string   file_name;
-    std::uint32_t maximum_errors;
 };
 
 class Connection

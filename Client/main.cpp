@@ -4,6 +4,7 @@
 #include <string>
 #include <optional>
 #include <fstream>
+#include <thread>
 
 
 // #pragma warning (disable : 4996)
@@ -33,7 +34,9 @@ struct ClientConfig
             bResult &= JSON_GET_AND_PARSE(clientConfigJson, package_size, is_number_unsigned);
             bResult &= JSON_GET_AND_PARSE(clientConfigJson, timeout, is_array);
             bResult &= JSON_GET_AND_PARSE(clientConfigJson, file_name, is_string);
-            bResult &= JSON_GET_AND_PARSE(clientConfigJson, maximum_errors, is_number_unsigned);
+            bResult &= JSON_GET_AND_PARSE(clientConfigJson, apply_socket_timeout, is_boolean);
+            bResult &= JSON_GET_AND_PARSE(clientConfigJson, apply_select_timeout, is_boolean);
+            bResult &= JSON_GET_AND_PARSE(clientConfigJson, number_of_tries, is_number_unsigned);
         }
 
         return bResult;
@@ -51,11 +54,14 @@ struct ClientConfig
         {
             confgFile << nlohmann::json
                     {
-                        {"server_ip"   , server_ip   },
-                        {"server_port" , server_port },
-                        {"package_size", package_size},
-                        {"timeout"     , timeout     },
-                        {"file_name"   , file_name   }
+                        {"server_ip"            , server_ip           },
+                        {"server_port"          , server_port         },
+                        {"package_size"         , package_size        },
+                        {"timeout"              , timeout             },
+                        {"file_name"            , file_name           },
+                        {"apply_socket_timeout" , apply_socket_timeout},
+                        {"apply_select_timeout" , apply_select_timeout},
+                        {"number_of_tries"      , number_of_tries     }
                     };
         }
 
@@ -67,7 +73,9 @@ struct ClientConfig
     std::uint32_t              package_size;
     std::vector<std::uint32_t> timeout;
     std::string                file_name;
-    std::uint32_t              maximum_errors;
+    bool                       apply_socket_timeout;
+    bool                       apply_select_timeout;
+    std::uint32_t              number_of_tries;
 };
 
 int main(int argc, char **argv)
@@ -83,7 +91,9 @@ int main(int argc, char **argv)
             config->package_size = 16;
             config->timeout = { 25, 50, 75 };
             config->file_name = "in.dat";
-            config->maximum_errors = 10;
+            config->apply_socket_timeout = true;
+            config->apply_select_timeout = true;
+            config->number_of_tries = 1;
             config->serialize(configName);
 
             print_std("Generated default config: ", configName);
@@ -171,14 +181,12 @@ int main(int argc, char **argv)
         fileProcessConfig.timeouts = clientConfig->timeout.size();
         fileProcessConfig.package_size = clientConfig->package_size;
         fileProcessConfig.file_name = clientConfig->file_name;
-        fileProcessConfig.maximum_errors = clientConfig->maximum_errors;
 
         auto const strFileProcessConfig = nlohmann::json
             {
                 {"timeouts"      , fileProcessConfig.timeouts      },
                 {"package_size"  , fileProcessConfig.package_size  },
                 {"file_name"     , fileProcessConfig.file_name     },
-                {"maximum_errors", fileProcessConfig.maximum_errors}
             }.dump();
 
         // Send number of timeouts to server
@@ -191,57 +199,17 @@ int main(int argc, char **argv)
         }
     }
 
-    auto nFileCounter = std::uint32_t{ 0 };
-    for (auto const& nTimeout : clientConfig->timeout)
+//    connection.setsockopt(SOL_SOCKET, SO_SNDBUF, static_cast<int>(clientConfig->package_size));
+
+    auto const defaultSendTime = static_cast<int>( std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::seconds{30}).count() );
+
+    connection.send_val(clientConfig->number_of_tries);
+    auto const nTries = clientConfig->number_of_tries;
+    for(int nTry = 0; nTry < nTries; ++nTry)
     {
-
-        auto fin = std::ifstream{ clientConfig->file_name, std::ios::binary };
-        if (!fin) {
-            print_err("Failed to open file: ", clientConfig->file_name);
-            return 1;
-        }
-
+        auto nFileCounter = std::uint32_t{ 0 };
+        for (auto const& nTimeout : clientConfig->timeout)
         {
-            // Send timeout to server
-            connection.send_val(nTimeout);
-            if (connection.is_socket_error()) {
-                print_err("Failed to send current timeout to server with error: ", WSAGetLastError());
-                return 1;
-            }
-
-        }
-
-        auto const nFileSize = [&]()
-        {
-            fin.seekg(0, std::ios::end);
-            auto const _nFileSize = std::int64_t{ fin.tellg() };
-            fin.seekg(0, std::ios::beg);
-
-            // Send timeout to server
-            connection.send_val(_nFileSize);
-            return _nFileSize;
-        } ();
-
-        print_std("---------------");
-        print_std("--   START   --");
-        print_std("---------------");
-        print_std("Receiving file ", std::to_string(nFileCounter));
-        print_std("File name: ", clientConfig->file_name);
-        print_std("File size: ", nFileSize, " bytes");
-        print_std("Timeout: ", nTimeout);
-        print_std("---------------");
-
-        if(clientConfig->maximum_errors > 0)
-        {
-            auto nErrorCounter = std::uint32_t{0};
-            auto nErrorSeqCounter = std::uint32_t{0};
-            auto nErrorMaxSeqCounter = std::uint32_t{0};
-
-            auto nCurFileSize = std::int64_t{ 0 };
-
-//        auto const tv = static_cast<int>(nTimeout);
-//        setsockopt(*connectSocket, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
-
             auto tv = [&]()
             {
                 auto _tv = timeval{};
@@ -250,85 +218,106 @@ int main(int argc, char **argv)
                 return _tv;
             } ();
 
-            while (nCurFileSize < nFileSize && nErrorMaxSeqCounter < clientConfig->maximum_errors)
             {
-                // Send/Receive loop
-                if(nErrorSeqCounter == 0)
-                {
-                    fin.read(buffer.data(), buffer.size());
+                // Send timeout to server
+                connection.send_val(nTimeout);
+                if (connection.is_socket_error()) {
+                    print_err("Failed to send current timeout to server with error: ", WSAGetLastError());
+                    return 1;
+                }
+            }
+
+            auto const nFileSize = [&]()
+            {
+                auto fin = std::ifstream{ clientConfig->file_name, std::ios::binary };
+                if (!fin) {
+                    print_err("Failed to open file: ", clientConfig->file_name);
+                    return std::int64_t{-1};
                 }
 
-                fd_set fdWrite;
-                FD_ZERO(&fdWrite);
-                FD_SET(connection.getSocket(), &fdWrite);
-                auto const iRet = select(0, nullptr, &fdWrite, nullptr, &tv);
-                auto const bFdIsSet = FD_ISSET(connection.getSocket(), &fdWrite);
+                fin.seekg(0, std::ios::end);
+                auto const _nFileSize = std::int64_t{ fin.tellg() };
+                fin.seekg(0, std::ios::beg);
 
-                if(iRet > 0 && bFdIsSet)
+                buffer.resize(_nFileSize);
+                fin.read(buffer.data(), _nFileSize);
+
+                // Send timeout to server
+                connection.send_val(_nFileSize);
+                return _nFileSize;
+            } ();
+
+            if(nFileSize == -1)
+                return 1;
+
+            print_std(":: try: ", nTry, ", file: ", std::to_string(nFileCounter), " - ", clientConfig->file_name, ", file size: ",  nFileSize, " bytes", ", timeout: ", nTimeout);
+
+
+            {
+                if(clientConfig->apply_socket_timeout)
                 {
-                    auto const nBytesReed = fin.gcount();
-                    connection.send(buffer.data(), nBytesReed);
+                    connection.setsockopt(SOL_SOCKET, SO_SNDTIMEO, static_cast<int>(nTimeout));
+                }
 
-                    nErrorMaxSeqCounter = std::max(nErrorMaxSeqCounter, nErrorSeqCounter);
-                    nErrorSeqCounter = 0;
+                auto nCurFileSize = std::int64_t{ 0 };
 
-                    nCurFileSize += nBytesReed;
+                while (nCurFileSize < nFileSize)
+                {
+                    auto const iRet = [&]()
+                    {
+                        if(clientConfig->apply_select_timeout)
+                        {
+                            fd_set fdWrite;
+                            FD_ZERO(&fdWrite);
+                            FD_SET(connection.getSocket(), &fdWrite);
+                            return select(0, nullptr, &fdWrite, nullptr, &tv);
+                        }
+                        else
+                        {
+                            return 1;
+                        }
+                    } ();
+
+                    if(iRet > 0)
+                    {
+                        auto const nBytesReed = std::min<std::int64_t>(clientConfig->package_size, nFileSize - nCurFileSize);
+
+                        connection.send(buffer.data(), nBytesReed);
+
+                        if(!connection.is_socket_error())
+                        {
+                            nCurFileSize += connection.getResult();
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                if(clientConfig->apply_socket_timeout && !connection.is_socket_error())
+                {
+                    connection.setsockopt(SOL_SOCKET, SO_SNDTIMEO, defaultSendTime);
+                }
+
+                print_std("-- Sent: ", nCurFileSize, " bytes");
+                print_std("---------------");
+                print_std();
+
+                if(!connection.is_socket_error())
+                {
+                    print_std("!! File sent successfully");
                 }
                 else
                 {
-                    ++nErrorCounter;
-                    ++nErrorSeqCounter;
+                    break;
                 }
             }
 
-            if(nErrorMaxSeqCounter != clientConfig->maximum_errors)
-            {
-                print_std("!! File sent successfully");
-            }
-            else
-            {
-                print_err("?? File not sent");
-            }
-
-            print_std("-- Sent: ", nCurFileSize, " bytes");
-            print_std("-- Errors: ", nErrorCounter);
-            print_std("-- Max errors in sequence: ", nErrorMaxSeqCounter, "/", clientConfig->maximum_errors);
-
-            print_std("---------------");
-            print_std();
+            ++nFileCounter;
         }
-        else
-        {
-            connection.setsockopt(SOL_SOCKET, SO_SNDTIMEO, static_cast<int>(nTimeout));
-
-            auto nCurFileSize = std::int64_t{ 0 };
-
-            while (nCurFileSize < nFileSize && !connection.is_socket_error())
-            {
-                fin.read(buffer.data(), buffer.size());
-
-                auto const nBytesReed = fin.gcount();
-                connection.send(buffer.data(), nBytesReed);
-
-                nCurFileSize += nBytesReed;
-            }
-
-            if(connection.is_socket_error())
-            {
-                print_err("?? File not sent");
-            }
-            else
-            {
-                print_std("!! File sent successfully");
-            }
-
-            print_std("-- Sent: ", nCurFileSize, " bytes");
-            print_std("---------------");
-            print_std();
-        }
-
-        ++nFileCounter;
     }
+
 
 
     {

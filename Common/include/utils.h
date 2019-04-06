@@ -104,13 +104,37 @@ T from_string(std::string const& str)
 template <typename TDuration = std::chrono::milliseconds, typename TFunc, typename...TArgs>
 TDuration exec_duration(TFunc &&func, TArgs...args)
 {
-    auto const start = std::chrono::high_resolution_clock::now();
+    auto const start = std::chrono::system_clock::now();
 
     func(std::forward<TArgs>(args)...);
 
-    auto const finish = std::chrono::high_resolution_clock::now();
+    auto const finish = std::chrono::system_clock::now();
 
     return std::chrono::duration_cast<TDuration>(finish - start);
+}
+
+template <typename TDuration = std::chrono::milliseconds, typename TFunc, typename...TArgs>
+TDuration exec_duration_windows(TFunc &&func, TArgs...args)
+{
+    LARGE_INTEGER frequency;        // ticks per second
+    LARGE_INTEGER t1, t2;           // ticks
+    double elapsedTime;
+
+// get ticks per second
+    QueryPerformanceFrequency(&frequency);
+
+    QueryPerformanceCounter(&t1);
+
+    func(std::forward<TArgs>(args)...);
+
+    QueryPerformanceCounter(&t2);
+
+// compute and print the elapsed time in microsec
+    elapsedTime = static_cast<double>(t2.QuadPart - t1.QuadPart) / frequency.QuadPart;
+
+    auto const chronoElapsedTime = std::chrono::duration<double, std::ratio<1, 1>>{elapsedTime};
+
+    return std::chrono::duration_cast<TDuration>(chronoElapsedTime);
 }
 
 /*****************

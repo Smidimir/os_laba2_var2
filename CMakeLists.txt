@@ -2,11 +2,12 @@ cmake_minimum_required(VERSION 3.13)
 
 project(OsLaba2Var2)
 
+set(CMAKE_BUILD_TYPE Release)
+
 add_subdirectory(Common)
 add_subdirectory(Client)
 add_subdirectory(Server)
 add_subdirectory(WinsockTest)
-
 
 set_target_properties( OsLaba2Var2Client
         PROPERTIES

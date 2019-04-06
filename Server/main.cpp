@@ -43,7 +43,9 @@ struct ServerConfig
 
             bResult &= !configFile.fail();
 
-            bResult &= JSON_GET_AND_PARSE(serverConfigJson, server_port, is_string);
+            bResult &= JSON_GET_AND_PARSE(serverConfigJson, server_port         , is_string);
+            bResult &= JSON_GET_AND_PARSE(serverConfigJson, apply_socket_timeout, is_boolean);
+            bResult &= JSON_GET_AND_PARSE(serverConfigJson, apply_select_timeout, is_boolean);
         }
 
         return bResult;
@@ -61,20 +63,24 @@ struct ServerConfig
         {
             confgFile << nlohmann::json
                 {
-                    {"server_port"       , server_port       },
+                    {"server_port"          , server_port         },
+                    {"apply_socket_timeout" , apply_socket_timeout},
+                    {"apply_select_timeout" , apply_select_timeout}
                 };
         }
 
         return bResult;
     }
 
-    std::string   server_port;
+    std::string server_port;
+    bool        apply_socket_timeout;
+    bool        apply_select_timeout;
 };
 
 struct TimeData
 {
     std::uint32_t timeout;
-    std::uint32_t recv_time;
+    std::int64_t recv_time;
 };
 
 int main(int argc, char** argv)
@@ -86,6 +92,8 @@ int main(int argc, char** argv)
         auto config = std::optional<ServerConfig>{ ServerConfig{} };
         if (!config->deserialize(configName)) {
             config->server_port = "9999";
+            config->apply_socket_timeout = true;
+            config->apply_select_timeout = true;
             config->serialize(configName);
 
             print_std("Generated default config: ", configName);
@@ -180,46 +188,26 @@ int main(int argc, char** argv)
         JSON_GET_AND_PARSE_MEMBER(jsonFileProcessConfig, _fileProcessConfig, timeouts, is_number_unsigned);
         JSON_GET_AND_PARSE_MEMBER(jsonFileProcessConfig, _fileProcessConfig, package_size, is_number_unsigned);
         JSON_GET_AND_PARSE_MEMBER(jsonFileProcessConfig, _fileProcessConfig, file_name, is_string);
-        JSON_GET_AND_PARSE_MEMBER(jsonFileProcessConfig, _fileProcessConfig, maximum_errors, is_number_unsigned);
 
         return _fileProcessConfig;
     } ();
 
-    if(buffer.size() < fileProcessConfig.package_size)
-    {
-        buffer.resize(fileProcessConfig.package_size);
-    }
-
     auto timeData = std::vector<TimeData>{};
-    timeData.reserve(fileProcessConfig.timeouts);
+    timeData.resize(fileProcessConfig.timeouts);
 
-    for (std::size_t i{ 0 }; i < fileProcessConfig.timeouts; ++i)
+    auto const defaultRecvTime = static_cast<int>( std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::seconds{30}).count() );
+
+//    connection.setsockopt(SOL_SOCKET, SO_RCVBUF, static_cast<int>(fileProcessConfig.package_size));
+
+    auto const nTries = connection.recv_val<std::uint32_t>();
+    for(int nTry = 0; nTry < nTries; ++nTry)
     {
-        timeData.emplace_back();
+        auto itTimeData = timeData.begin();
 
-        auto const nTimeout = connection.recv_val<std::uint32_t>();
-        auto const nFileSize = connection.recv_val<std::int64_t>();
-
-        timeData.back().timeout = nTimeout;
-
-        auto const strOutFileName = "out_"s + std::to_string(i) + "_"s + fileProcessConfig.file_name;
-        auto fout = std::ofstream{ strOutFileName, std::ios::binary | std::ios::out };
-        if (!fout) {
-            print_err("Failed to open file ", strOutFileName);
-            return 1;
-        }
-
-        print_std("---------------");
-        print_std("--   START   --");
-        print_std("---------------");
-        print_std("Receiving file ", std::to_string(i));
-        print_std("File name: ", strOutFileName);
-        print_std("File size: ", nFileSize, " bytes");
-        print_std("Timeout: ", nTimeout);
-        print_std("---------------");
-
-        if(fileProcessConfig.maximum_errors > 0)
+        for (std::size_t i{ 0 }; i < fileProcessConfig.timeouts; ++i)
         {
+            auto const nTimeout = connection.recv_val<std::uint32_t>();
+
             auto tv = [&]()
             {
                 auto _tv = timeval{};
@@ -228,99 +216,106 @@ int main(int argc, char** argv)
                 return _tv;
             } ();
 
-            auto nErrorCounter = std::uint32_t{0};
-            auto nErrorSeqCounter = std::uint32_t{0};
-            auto nErrorMaxSeqCounter = std::uint32_t{0};
-
-            auto nCurFileSize = std::int64_t{ 0 };
-
-            timeData.back().recv_time = (std::uint32_t)exec_duration<std::chrono::microseconds>(
-                    [&]()
-                    {
-                        while (nCurFileSize < nFileSize && nErrorSeqCounter < fileProcessConfig.maximum_errors)
-                        {
-                            fd_set fdRead;
-                            FD_ZERO(&fdRead);
-                            FD_SET(connection.getSocket(), &fdRead);
-                            auto const iRet = select(0, &fdRead, nullptr, nullptr, &tv);
-                            auto const bFdIsSet = FD_ISSET(connection.getSocket(), &fdRead);
-
-                            if(iRet > 0 && bFdIsSet)
-                            {
-                                auto const nPackageSize = std::min<std::int64_t>(fileProcessConfig.package_size, nFileSize - nCurFileSize);
-
-                                auto const iResult = connection.recv(buffer.data(), nPackageSize);
-
-                                nErrorMaxSeqCounter = std::max(nErrorMaxSeqCounter, nErrorSeqCounter);
-                                nErrorSeqCounter = 0;
-
-                                fout.write(buffer.data(), iResult);
-                                nCurFileSize += nPackageSize;
-                            }
-                            else
-                            {
-                                ++nErrorCounter;
-                                ++nErrorSeqCounter;
-                            }
-                        }
-                    }).count();
-
-            print_std("---------------");
-
-            if(nErrorMaxSeqCounter != fileProcessConfig.maximum_errors)
+            auto const nFileSize = connection.recv_val<std::int64_t>();
+            if(connection.is_socket_error())
             {
-                print_std("!! File received successfully");
-            }
-            else
-            {
-                print_err("?? File not received");
+                break;
             }
 
-            print_std("-- Recieved: ", nCurFileSize, " bytes");
-            print_std("-- Errors: ", nErrorCounter);
-            print_std("-- Max errors in sequence: ", nErrorMaxSeqCounter, "/", fileProcessConfig.maximum_errors);
-            print_std("---------------");
-            print_std();
-        }
-        else
-        {
-            connection.setsockopt(SOL_SOCKET, SO_RCVTIMEO, static_cast<int>(nTimeout));
+            buffer.resize(nFileSize);
 
-            auto nCurFileSize = std::int64_t{ 0 };
+            itTimeData->timeout = nTimeout;
 
-            timeData.back().recv_time = (std::uint32_t)exec_duration<std::chrono::microseconds>(
-                    [&]()
-                    {
-                        while (nCurFileSize < nFileSize)
+            auto const strOutFileName = "out_"s + std::to_string(i) + "_"s + fileProcessConfig.file_name;
+
+            print_std(":: try: ", nTry, ", file: ", std::to_string(i), " - ", strOutFileName, ", file size: ",  nFileSize, " bytes", ", timeout: ", nTimeout);
+
+
+            {
+                if(serverConfig->apply_socket_timeout)
+                {
+                    connection.setsockopt(SOL_SOCKET, SO_RCVTIMEO, static_cast<int>(nTimeout));
+                }
+
+                auto nCurFileSize = std::int64_t{ 0 };
+
+                itTimeData->recv_time += exec_duration_windows<std::chrono::microseconds>(
+                        [&]()
                         {
-                            auto const nPackageSize = std::min<std::int64_t>(fileProcessConfig.package_size, nFileSize - nCurFileSize);
-
-                            connection.recv(buffer.data(), nPackageSize);
-
-                            if(connection.is_socket_error())
+                            while (nCurFileSize < nFileSize)
                             {
-                                break;
+                                auto const iRet = [&]()
+                                {
+                                    if(serverConfig->apply_select_timeout)
+                                    {
+                                        fd_set fdRead;
+                                        FD_ZERO(&fdRead);
+                                        FD_SET(connection.getSocket(), &fdRead);
+                                        return select(0, &fdRead, nullptr, nullptr, &tv);
+                                    }
+                                    else
+                                    {
+                                        return 1;
+                                    }
+                                } ();
+
+
+                                if(iRet > 0)
+                                {
+                                    auto const nPackageSize = std::min<std::int64_t>(fileProcessConfig.package_size, nFileSize - nCurFileSize);
+
+                                    connection.recv(buffer.data() + nCurFileSize, nPackageSize);
+
+                                    if(!connection.is_socket_error())
+                                    {
+//                                    print_std(":: !! recv: ", connection.getResult(), ", size: ", nCurFileSize);
+                                        nCurFileSize += connection.getResult();
+                                    }
+                                    else
+                                    {
+//                                    print_std(":: ?? error");
+                                        print_err(":: connection.getResult(): ", connection.getResult(), " : ", WSAGetLastError());
+                                        break;
+                                    }
+                                }
+                                else
+                                {
+                                    print_std(":: skip package", iRet);
+                                }
                             }
-                            else
-                            {
-                                fout.write(buffer.data(), connection.getResult());
-                                nCurFileSize += nPackageSize;
-                            }
-                        }
-                    }).count();
+                        }).count();
 
+                if(serverConfig->apply_socket_timeout && !connection.is_socket_error())
+                {
+                    connection.setsockopt(SOL_SOCKET, SO_RCVTIMEO, defaultRecvTime);
+                }
 
-            if(connection.is_socket_error())
-                print_err("?? File not received");
-            else
-                print_std("!! File received successfully");
+                if(connection.is_socket_error())
+                {
+                    print_err("?? File not received");
+                    break;
+                }
+                else
+                {
+                    print_std("!! File received successfully");
+                }
 
-            print_std("-- Recieved: ", nCurFileSize, " bytes");
-            print_std("---------------");
-            print_std();
+                print_std("-- Recieved: ", nCurFileSize, " bytes");
+                print_std("---------------");
+                print_std();
+            }
 
-            if(connection.is_socket_error())
-                return 1;
+            {
+                auto fout = std::ofstream{ strOutFileName, std::ios::binary | std::ios::out };
+                if (!fout) {
+                    print_err("Failed to open file ", strOutFileName);
+                    return 1;
+                }
+
+                fout.write(buffer.data(), nFileSize);
+            }
+
+            ++itTimeData;
         }
     }
 
@@ -334,10 +329,12 @@ int main(int argc, char** argv)
         });
         fout << timeData.back().timeout << std::endl;
 
-        std::for_each(timeData.cbegin(), std::prev(timeData.cend()), [&](auto const& td)
+        std::for_each(timeData.begin(), std::prev(timeData.end()), [&](auto& td)
         {
+            td.recv_time /= nTries;
             fout << td.recv_time << ",";
         });
+        timeData.back().recv_time /= nTries;
         fout << timeData.back().recv_time << std::endl;
 
     }

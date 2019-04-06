@@ -9,6 +9,18 @@
 
 int main(int argc, char** argv)
 {
+    {
+        auto time = exec_duration_windows<std::chrono::milliseconds>(
+                []()
+                {
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                });
+
+        print_std(time.count());
+    }
+
+    return 0;
+
     // Initialize Winsock
     auto const wsaData = createWSADataRaii();
     if (!wsaData) {
